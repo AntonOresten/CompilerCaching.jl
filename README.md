@@ -1,8 +1,15 @@
 # CompilerCaching.jl
 
 A package for interfacing with Julia's compiler caching infrastructure for the purpose
-of building custom compilers. It extends the existing `InternalCodeCache` type with
-auxiliary functionality.
+of building custom compilers. It provides a typed view on the integrated code cache
+(`Core.Compiler.InternalCodeCache`), drives inference into it, and attaches custom
+compilation results to cached `CodeInstance`s — including across precompilation, so
+that compilers building on this package can ship precompiled artifacts in package
+images.
+
+Requires Julia 1.11 or later. On older versions the package loads as an empty shell,
+so that downstream packages can depend on it unconditionally and provide their own
+fallback (e.g. GPUCompiler.jl, which retains a session-local cache on Julia 1.10).
 
 
 ## Installation
@@ -68,35 +75,39 @@ end
 The `create_ci` function creates a bare code instance with (initially empty)
 compilation results. Most users will want to rely on Julia's type inference
 to instead populate the cache with a code instance that knows about dependent
-methods for invalidation purposes, and contains inferred source code for further.
-compilation This can be done with a custom abstract interpreter and the `typeinf!`
+methods for invalidation purposes, and contains inferred source code for further
+compilation. This can be done with a custom abstract interpreter and the `typeinf!`
 function from this package:
 
 ```julia
 # Set-up a custom interpreter, and link it to the cache
 struct CustomInterpreter <: CC.AbstractInterpreter
-    cache::CacheView
+    world::UInt
     ...
 end
-@setup_caching CustomInterpreter.cache
+CC.cache_owner(::CustomInterpreter) = :MyCompiler
+CC.get_inference_world(interp::CustomInterpreter) = interp.world
 
 function compile!(cache, mi)
     # Get CI through inference
     ci = get(cache, mi, nothing)
     if ci === nothing
-        interp = CustomInterpreter(cache)
-        CompilerCaching.typeinf!(cache, interp, mi)
-        ci = get(cache, mi)
+        interp = CustomInterpreter(cache.world)
+        ci = CompilerCaching.typeinf!(interp, mi)
     end
 
     # ... further compilation steps
 end
 ```
 
-The `@setup_caching` macro defines the necessary methods to connect the interpreter
-to the cache:
-- `CC.cache_owner(interp)` returning the cache's owner token
-- `CC.finish!(interp, caller, ...)` that stacks a new `V()` instance in analysis results
+Beyond the standard `AbstractInterpreter` interface, the interpreter only needs the
+two methods Julia itself uses to address the integrated cache:
+- `CC.cache_owner(interp)` — partitions the integrated cache (same-owner CIs share storage)
+- `CC.get_inference_world(interp)` — world age inference runs at
+
+There is no inference-time hook for results: `results(cache, ci)` attaches the
+results struct on first access, so any interpreter whose owner matches the cache
+view works out of the box.
 
 
 ## Cache sharding

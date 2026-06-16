@@ -10,6 +10,26 @@
 
 module CompilerCaching
 
+"""
+    @public foo, bar
+
+Declare `foo, bar` as public API. Lowers to `public foo, bar` on 1.11+ (where `public`
+is keyword syntax) and to a no-op on 1.10. Lets the rest of the module use a single
+form regardless of Julia version, without `Meta.parse` workarounds.
+"""
+macro public(symbols_expr)
+    syms = symbols_expr isa Symbol ? [symbols_expr] :
+           symbols_expr.head === :tuple ? [a isa Symbol ? a : a.args[1] for a in symbols_expr.args] :
+           [symbols_expr.args[1]]
+    if VERSION >= v"1.11.0-DEV.469"
+        esc(Expr(:public, syms...))
+    else
+        nothing
+    end
+end
+
+@static if VERSION >= v"1.11"
+
 using Base.Experimental: @MethodTable
 const CC = Core.Compiler
 
@@ -20,7 +40,7 @@ include("utils.jl")
 # CacheView structure
 #==============================================================================#
 
-export CacheView, @setup_caching, results, lookup
+export CacheView, results, lookup
 
 """
     SpecializedResult{V}
@@ -53,8 +73,9 @@ end
     CachedResult{V}
 
 Mutable wrapper for analysis results that supports both generic and const-specialized
-entries. Stored once in the CI's `analysis_results` chain at creation time. Const-prop
-entries are accumulated by pushing to `const_entries`.
+entries. Attached to a CI's `analysis_results` chain on first access (see
+[`results`](@ref)) or at CI creation (see [`create_ci`](@ref)). Const-prop entries are
+accumulated by pushing to `const_entries`.
 """
 mutable struct CachedResult{V}
     inner::V
@@ -158,53 +179,6 @@ end
 CacheView{V}(owner::K, world::UInt) where {K,V} = CacheView{K,V}(owner, world)
 
 """
-    @setup_caching InterpreterType.cache_field
-
-Generate the required methods for an AbstractInterpreter to work with CompilerCaching.
-
-The cache field must be a `CacheView{K, V}` where `V` is your typed results struct.
-The macro generates:
-- `CC.cache_owner(interp)` returning the cache's owner token
-- `CC.finish!(interp, caller, ...)` that stacks a new `V()` instance in analysis results
-"""
-macro setup_caching(expr)
-    # Parse InterpreterType.cache_field
-    if !(expr isa Expr && expr.head == :.)
-        error("Expected InterpreterType.cache_field, e.g., @setup_caching MyInterpreter.cache")
-    end
-    InterpType = expr.args[1]
-    cache_field = expr.args[2]
-    if cache_field isa QuoteNode
-        cache_field = cache_field.value
-    end
-
-    finish_method = if hasmethod(CC.finish!, Tuple{CC.AbstractInterpreter, CC.InferenceState, UInt, UInt64})
-        quote
-            function $CC.finish!(interp::$InterpType, caller::$CC.InferenceState,
-                                 validation_world::UInt, time_before::UInt64)
-                V = $results_type(interp.$cache_field)
-                $CC.stack_analysis_result!(caller.result, $CachedResult{V}(V()))
-                @invoke $CC.finish!(interp::$CC.AbstractInterpreter, caller::$CC.InferenceState,
-                                    validation_world::UInt, time_before::UInt64)
-            end
-        end
-    else
-        quote
-            function $CC.finish!(interp::$InterpType, caller::$CC.InferenceState)
-                V = $results_type(interp.$cache_field)
-                $CC.stack_analysis_result!(caller.result, $CachedResult{V}(V()))
-                @invoke $CC.finish!(interp::$CC.AbstractInterpreter, caller::$CC.InferenceState)
-            end
-        end
-    end
-
-    quote
-        $CC.cache_owner(interp::$InterpType) = $cache_owner(interp.$cache_field)
-        $finish_method
-    end |> esc
-end
-
-"""
     cache_owner(cache::CacheView)
 
 Returns the owner token for use as CodeInstance.owner.
@@ -214,25 +188,89 @@ cache_owner(cache::CacheView) = cache.owner
 """
     results_type(cache::CacheView{K,V}) -> Type{V}
 
-Returns the results type V for a cache view.
+The results type addressed by this cache view.
 """
 results_type(::CacheView{K,V}) where {K,V} = V
+
+
+## results attachment
+#
+# Results structs are attached to a CodeInstance's `analysis_results` chain *lazily*, on
+# first access through `results` / `lookup`. This keeps inference entirely results-free:
+# interpreters need no CompilerCaching-specific hooks (no `CC.finish!` override), and a
+# single CI can carry results for multiple independent consumers (distinct `V` types
+# coexist on the chain).
+
+# `analysis_results` is declared const on Julia 1.11–1.13 (the C runtime mutates it in
+# place after optimization), so plain `setfield!` is rejected and — more subtly — repeated
+# `getfield`s may legally be CSE'd. We mutate through `jl_set_nth_field` (the same way
+# `Serialization` writes const fields during deserialization) and re-read through an
+# opaque ccall when re-checking under the lock.
+const ANALYSIS_RESULTS_FIELD = something(findfirst(==(:analysis_results),
+                                                   fieldnames(Core.CodeInstance)))
+
+read_analysis_results(ci::Core.CodeInstance) =
+    ccall(:jl_get_nth_field_checked, Any, (Any, Csize_t), ci, ANALYSIS_RESULTS_FIELD-1)
+
+# Lock serializing chain mutations. Attachment is rare (once per (CI, V) pair), so a
+# single global lock suffices. Plain (lock-free) reads are safe: chain nodes are
+# immutable and only ever prepended, and `jl_set_nth_field` stores with release
+# semantics.
+#
+# The C runtime also writes this field, without taking our lock: `jl_fill_codeinst`
+# (and `jl_update_codeinst`) overwrite it wholesale when inference finishes. That's
+# only safe because those writes happen while the CI is still private to the inference
+# engine (jl_fill_codeinst asserts min_world == 1 / max_world == 0, i.e.
+# pre-publication). Corollary: only attach results to CIs that have been published to
+# the integrated cache — never to a CI still being inferred.
+const attach_lock = ReentrantLock()
+
+@noinline function attach_results!(::Type{V}, ci::Core.CodeInstance) where V
+    Base.@lock attach_lock begin
+        # re-read and re-check under the lock: another task may have attached while we
+        # were acquiring it (the ccall also defeats CSE with the pre-lock traversal)
+        chain = read_analysis_results(ci)
+        head = chain isa CC.AnalysisResults ? chain : CC.NULL_ANALYSIS_RESULTS
+        node = head
+        while isdefined(node, :next)
+            node.result isa CachedResult{V} && return node.result::CachedResult{V}
+            node = node.next
+        end
+
+        cached = CachedResult{V}(V())
+        ccall(:jl_set_nth_field, Cvoid, (Any, Csize_t, Any), ci,
+              ANALYSIS_RESULTS_FIELD-1, CC.AnalysisResults(cached, head))
+        return cached
+    end
+end
+
+function find_results(::Type{V}, ci::Core.CodeInstance) where V
+    CC.traverse_analysis_results(ci) do @nospecialize result
+        result isa CachedResult{V} ? result : nothing
+    end
+end
+
+@inline function get_results(::Type{V}, ci::Core.CodeInstance) where V
+    cached = find_results(V, ci)
+    cached === nothing && (cached = attach_results!(V, ci))
+    return cached::CachedResult{V}
+end
 
 """
     results(::Type{V}, ci::CodeInstance)::V
     results(cache::CacheView{K,V}, ci::CodeInstance)::V
 
-Retrieve the generic typed results struct from a CodeInstance's `analysis_results` chain.
-Throws if no V is found - this indicates @setup_caching wasn't used correctly
-or create_ci wasn't called.
+Retrieve the typed results struct of type `V` from a CodeInstance, creating and
+attaching a fresh `V()` on first access. The same instance is returned for every
+subsequent call with the same `V`, for the lifetime of the CodeInstance (including
+across precompilation, when both the CI and its results are serialized into the
+package image).
+
+Mutations to a results struct attached to a CodeInstance that was loaded from a
+*different* package image do not persist beyond the current (pre)compilation session;
+only the image that serialized the CI owns its storage.
 """
-function results(::Type{V}, ci::Core.CodeInstance)::V where V
-    cached = CC.traverse_analysis_results(ci) do @nospecialize result
-        result isa CachedResult{V} ? result : nothing
-    end
-    @assert cached !== nothing "CodeInstance missing $V results - ensure @setup_caching is used or create_ci was called"
-    return cached.inner
-end
+results(::Type{V}, ci::Core.CodeInstance) where V = get_results(V, ci).inner
 
 results(::CacheView{K,V}, ci::Core.CodeInstance) where {K,V} = results(V, ci)
 
@@ -240,13 +278,12 @@ results(::CacheView{K,V}, ci::Core.CodeInstance) where {K,V} = results(V, ci)
     results(::Type{V}, ci::CodeInstance, argtypes::Vector{Any})::V
     results(cache::CacheView{K,V}, ci::CodeInstance, argtypes::Vector{Any})::V
 
-Retrieve const-specialized results for a specific set of argument types.
+Retrieve const-specialized results for a specific set of argument types. Unlike the
+generic accessor, const-specialized entries are only created by [`typeinf!`](@ref)
+with `argtypes`; this throws if no matching entry exists.
 """
 function results(::Type{V}, ci::Core.CodeInstance, argtypes::Vector{Any})::V where V
-    cached = CC.traverse_analysis_results(ci) do @nospecialize result
-        result isa CachedResult{V} ? result : nothing
-    end
-    @assert cached !== nothing "CodeInstance missing $V results for argtypes $argtypes"
+    cached = get_results(V, ci)
     for entry in cached.const_entries
         argtypes_egal(entry.argtypes, argtypes) && return entry.inner
     end
@@ -285,9 +322,9 @@ Base.setindex!(cache::CacheView, ci::Core.CodeInstance, mi::Core.MethodInstance)
         Union{Nothing, Tuple{CodeInstance, V}}
 
 Combined `get(cache, mi)` + `results(cache, ci[, argtypes])` accessor — single-pass
-cache lookup. Returns `(ci, res)` on a hit, or `nothing` on a miss (no `CodeInstance`
-cached for `mi`, no `CachedResult{V}` on the CI, or — with `argtypes` — no matching
-const-prop entry).
+cache lookup. Returns `(ci, res)` when a `CodeInstance` is cached for `mi` (attaching
+a fresh `V()` on first access), or `nothing` when there is no CI — or, with
+`argtypes`, no matching const-prop entry.
 
 Hot-path callers (e.g. `cufunction`) typically need both `ci` and `res` and walk
 the same lookup multiple times across phases. Use `lookup` once and pass the
@@ -297,21 +334,14 @@ time.
 @inline function lookup(cache::CacheView{K,V}, mi::Core.MethodInstance) where {K,V}
     ci = get(cache, mi, nothing)
     ci === nothing && return nothing
-    cached = CC.traverse_analysis_results(ci) do @nospecialize result
-        result isa CachedResult{V} ? result : nothing
-    end
-    cached === nothing && return nothing
-    return (ci, cached.inner)
+    return (ci, results(V, ci))
 end
 
 @inline function lookup(cache::CacheView{K,V}, mi::Core.MethodInstance,
                         argtypes::Vector{Any}) where {K,V}
     ci = get(cache, mi, nothing)
     ci === nothing && return nothing
-    cached = CC.traverse_analysis_results(ci) do @nospecialize result
-        result isa CachedResult{V} ? result : nothing
-    end
-    cached === nothing && return nothing
+    cached = get_results(V, ci)
     for entry in cached.const_entries
         argtypes_egal(entry.argtypes, argtypes) && return (ci, entry.inner)
     end
@@ -353,7 +383,7 @@ end
 #==============================================================================#
 
 export add_method
-public captured_globals
+@public captured_globals
 
 """
     captured_globals(source) -> iterable of GlobalRef
@@ -459,7 +489,8 @@ end
 
 # jl_get_specialization1 doesn't support custom method tables (hardcodes jl_nothing).
 # Reimplement its pipeline (match → normalize → specialize) with method table support.
-function _specialization1(@nospecialize(sig), world::UInt, method_table::Core.MethodTable)
+function _specialization1(@nospecialize(sig), world::UInt,
+                          method_table::Union{Core.MethodTable,Nothing})
     matches = Base._methods_by_ftype(sig, method_table, 1, world)
     matches === nothing && return nothing
     length(matches) != 1 && return nothing
@@ -489,15 +520,27 @@ end
 # methods, causing lookups to fail or return stale global entries, so don't use the cache.
 # Use jl_get_specialization1 instead, which uses jl_matching_methods (not cached dispatch)
 # and returns compileable signatures (with proper vararg widening).
-# Fixed in 1.14.0-DEV.1581, backported to 1.13.0-beta2, 1.12.5, and 1.11.9.
-@static if (VERSION >= v"1.14.0-DEV.1581" ||
-            v"1.13.0-beta2" <= VERSION < v"1.14-" ||
+# The overlay lookup issue is fixed in 1.13.0-beta2, 1.12.5, and 1.11.9. On
+# 1.14+, `Base.method_instance` returns the dispatch-cache MI, and the compiler
+# normalizes that to a compilable MI later. Do the same here, since this API is
+# documented to return the compilation target.
+@static if (v"1.13.0-beta2" <= VERSION < v"1.14-" ||
             v"1.12.5" <= VERSION < v"1.13-" ||
             v"1.11.9" <= VERSION < v"1.12-")
     @inline function method_instance(@nospecialize(f), @nospecialize(tt);
                                      world::UInt=Base.get_world_counter(),
                                      method_table::Union{Core.MethodTable,Nothing}=nothing)
         Base.method_instance(f, tt; world, method_table)
+    end
+elseif VERSION >= v"1.14-"
+    @inline function method_instance(@nospecialize(f), @nospecialize(tt);
+                                     world::UInt=Base.get_world_counter(),
+                                     method_table::Union{Core.MethodTable,Nothing}=nothing)
+        sig = Base.signature_type(f, tt)
+        @assert isdispatchtuple(sig)
+        mi = Base.method_instance(sig; world, method_table)
+        mi === nothing && return nothing
+        return ccall(:jl_normalize_to_compilable_mi, Any, (Any,), mi)::Core.MethodInstance
     end
 elseif VERSION >= v"1.13-"
     # 3-arg jl_get_specialization1, returns jl_nothing on failure
@@ -571,15 +614,20 @@ method_instance
 export typeinf!, create_ci, get_source, get_codeinfos
 
 """
-    typeinf!(cache, interp, mi) -> Nothing
+    typeinf!(interp, mi) -> Union{CodeInstance, Nothing}
 
-Run type inference on `mi` and store the resulting CodeInstance in the cache.
-Eagerly compiles all callees and stores their source so `get_codeinfos` works.
-The CodeInstance can be retrieved with `get(cache, mi)`.
+Run type inference on `mi` using `interp`, storing the resulting `CodeInstance`
+in Julia's integrated cache (partitioned by `CC.cache_owner(interp)`). Eagerly
+compiles all callees and stores their source so [`get_codeinfos`](@ref) works.
+
+Returns the root `CodeInstance` (or `nothing` if inference failed). Subsequent
+calls for the same `mi` and world are no-ops — the existing CI is returned.
 """
-function typeinf!(cache::CacheView, interp::CC.AbstractInterpreter,
-                   mi::Core.MethodInstance)
+function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
     @static if VERSION >= v"1.12.0-DEV.1434"
+        @static if VERSION >= v"1.14-"
+            mi = ccall(:jl_normalize_to_compilable_mi, Any, (Any,), mi)::Core.MethodInstance
+        end
         ci = CC.typeinf_ext(interp, mi, CC.SOURCE_MODE_NOT_REQUIRED)
         ci === nothing && return nothing
 
@@ -610,12 +658,20 @@ function typeinf!(cache::CacheView, interp::CC.AbstractInterpreter,
                 continue
             end
 
-            src = CC.typeinf_code(interp, callee_mi, true)
-            if src isa Core.CodeInfo
+            # Reuse source already stored on the CI (by inference, or by a previous
+            # walk) instead of unconditionally calling `typeinf_code`, which re-runs
+            # inference and optimization without consulting the cache. This makes
+            # repeated walks over an already-populated graph (e.g. `cached_results`
+            # followed by the back-end's compile) traversal-only.
+            src = get_source(callee)
+            if src === nothing
+                src = CC.typeinf_code(interp, callee_mi, true)
                 # Store source so get_codeinfos can retrieve it later
-                if (@atomic callee.inferred) === nothing
+                if src isa Core.CodeInfo && (@atomic callee.inferred) === nothing
                     @atomic callee.inferred = src
                 end
+            end
+            if src isa Core.CodeInfo
                 if has_compilequeue
                     sptypes = CC.sptypes_from_meth_instance(callee_mi)
                     CC.collectinvokes!(workqueue, src, sptypes)
@@ -624,12 +680,15 @@ function typeinf!(cache::CacheView, interp::CC.AbstractInterpreter,
                 end
             end
         end
+        return ci
     elseif VERSION >= v"1.12.0-DEV.15"
+        cache = CacheView{Nothing}(CC.cache_owner(interp), CC.get_inference_world(interp))
         inferred_ci = CC.typeinf_ext_toplevel(interp, mi, CC.SOURCE_MODE_FORCE_SOURCE)
         @assert inferred_ci !== nothing "Inference of $mi failed"
 
-        # inference should have populated our cache
-        ci = get(cache, mi)
+        # inference should have populated the cache
+        ci = get(cache, mi, nothing)
+        ci === nothing && return nothing
 
         # if ci is rettype_const, the inference result won't have been cached
         # (because it is normally not supposed to be used ever again).
@@ -637,50 +696,55 @@ function typeinf!(cache::CacheView, interp::CC.AbstractInterpreter,
         if ci.inferred === nothing
             cache[mi] = inferred_ci
         end
+        return ci
     else
         # Julia 1.11: typeinf_ext_toplevel returns CodeInfo, not CI
+        cache = CacheView{Nothing}(CC.cache_owner(interp), CC.get_inference_world(interp))
         src = CC.typeinf_ext_toplevel(interp, mi)
         @assert src !== nothing "Inference of $mi failed"
 
-        # inference should have populated our cache
-        ci = get(cache, mi)
+        # inference should have populated the cache
+        ci = get(cache, mi, nothing)
+        ci === nothing && return nothing
 
-        # if ci is rettype_const, the inference result won't have been cached
-        # (because it is normally not supposed to be used ever again).
+        # if ci is rettype_const, the inference result won't have been cached.
         # to avoid the need to re-infer, set that field here.
         if ci.inferred === nothing
             @atomic ci.inferred = src
         end
+        return ci
     end
-    return
 end
 
 """
-    typeinf!(cache, interp, mi, argtypes) -> Nothing
+    typeinf!(cache::CacheView{K,V}, interp, mi, argtypes) -> Nothing
 
 Run const-seeded type inference on `mi` with enriched `argtypes` and store the result
-as a `CachedResult` entry on the generic CI's `analysis_results` chain.
+as a `SpecializedResult{V}` entry on the generic CI's `CachedResult{V}`.
 
 Uses Julia's ephemeral `:local` inference mode (same as internal const-prop) so no
 new CodeInstance is created. The const-specialized source and return type are stored
 alongside the generic result for later retrieval via `results(cache, ci, argtypes)`
 and `get_source(ci, argtypes)`.
+
+Unlike the generic `typeinf!(interp, mi)`, this form takes a `CacheView`: const-prop
+entries are stored typed, so the results type `V` must be known up front. The cache
+view must match the interpreter's owner and world.
 """
 function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
                   mi::Core.MethodInstance, argtypes::Vector{Any}) where {K,V}
+    @assert cache.owner === CC.cache_owner(interp) "CacheView owner does not match interpreter"
+    @assert cache.world == CC.get_inference_world(interp) "CacheView world does not match interpreter"
+
     # Ensure generic CI exists
     ci = get(cache, mi, nothing)
     if ci === nothing
-        typeinf!(cache, interp, mi)
+        typeinf!(interp, mi)
         ci = get(cache, mi, nothing)
         ci === nothing && return nothing
     end
 
-    # Find the CachedResult on this CI
-    cached = CC.traverse_analysis_results(ci) do @nospecialize result
-        result isa CachedResult{V} ? result : nothing
-    end
-    @assert cached !== nothing "CodeInstance missing CachedResult{$V}"
+    cached = get_results(V, ci)
 
     # Check if we already have a const-prop result for these argtypes
     for entry in cached.const_entries
@@ -721,13 +785,7 @@ function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
         src = CC.ir_to_codeinf!(src)
     end
 
-    # Extract V from ephemeral InferenceResult's analysis_results (stacked by finish!)
-    v = CC.traverse_analysis_results(inf_result) do @nospecialize r
-        r isa CachedResult{V} ? r.inner : nothing
-    end
-    if v === nothing
-        v = V()
-    end
+    v = V()
 
     # Compute rettype_const
     rettype = inf_result.result
@@ -775,9 +833,7 @@ Creates a new CodeInstance with:
   whenever any binding the source captures is replaced. The set of
   `GlobalRef`s is taken from [`captured_globals(mi.def.source)`](@ref captured_globals).
 
-Used for foreign mode where inference doesn't run. The CI participates in
-Julia's invalidation mechanism via backedges registered from `deps` (callee
-methods) and the `captured_globals` hook (referenced global bindings).
+Used for foreign mode where inference doesn't run.
 
 The asymmetry between `deps` (explicit kwarg) and bindings (implicit trait)
 is intentional. Captured bindings are a property of the source IR — fixed at
@@ -790,6 +846,7 @@ argument types of `mi`.
 function create_ci(cache::CacheView{K,V}, mi::Core.MethodInstance;
                    deps::Vector{Core.MethodInstance}=Core.MethodInstance[]) where {K,V}
     owner = cache.owner
+    world = cache.world
 
     @static if VERSION >= v"1.12-"
         binding_edges = Core.Binding[]
@@ -811,10 +868,10 @@ function create_ci(cache::CacheView{K,V}, mi::Core.MethodInstance;
 
     @static if VERSION >= v"1.12-"
         ci = Core.CodeInstance(mi, owner, Any, Any, nothing, nothing,
-            Int32(0), cache.world, typemax(UInt), UInt32(0), ar, nothing, edges)
+            Int32(0), world, typemax(UInt), UInt32(0), ar, nothing, edges)
     else
         ci = Core.CodeInstance(mi, owner, Any, Any, nothing, nothing,
-            Int32(0), cache.world, typemax(UInt), UInt32(0), UInt32(0), ar, UInt8(0))
+            Int32(0), world, typemax(UInt), UInt32(0), UInt32(0), ar, UInt8(0))
     end
 
     # Register backedges for automatic invalidation
@@ -999,5 +1056,7 @@ function get_codeinfos(ci::Core.CodeInstance, argtypes::Vector{Any})
     end
     return codeinfos
 end
+
+end # @static if VERSION >= v"1.11"
 
 end # module CompilerCaching

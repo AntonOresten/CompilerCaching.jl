@@ -65,16 +65,21 @@ end
     other_mi = method_instance(other_fn, (Int,); world)
     @test lookup(cache, other_mi) === nothing
 
-    # `lookup` miss when CI exists under the same owner but for a different V.
-    # CIs are keyed by owner, so a cache parameterized with a different V finds
-    # the CI but no `CachedResult{V}` on its analysis_results chain.
+    # Results structs for different `V`s coexist on the same CI: a cache view
+    # parameterized with another V finds the same CI and lazily attaches a fresh
+    # results struct alongside the existing one.
     mutable struct OtherResults
         result::Any
         OtherResults() = new(nothing)
     end
     cache_otherV = CacheView{Symbol, OtherResults}(:GlobalTest, world)
     @test get(cache_otherV, mi, nothing) === ci  # same owner → finds the CI
-    @test lookup(cache_otherV, mi) === nothing   # but no CachedResult{OtherResults}
+    other_hit = lookup(cache_otherV, mi)
+    @test other_hit isa Tuple{Core.CodeInstance, OtherResults}
+    @test other_hit[1] === ci
+    @test other_hit[2].result === nothing       # fresh, independent results
+    @test results(cache, ci) === res            # original results untouched
+    @test results(cache_otherV, ci) === other_hit[2]  # stable across accesses
 end
 
 @testset "compileable signatures" begin
@@ -206,7 +211,7 @@ end
     end
     TestInterpreter(cache::CacheView) =
         TestInterpreter(cache.world, cache, InfCacheT())
-    @setup_caching TestInterpreter.cache
+    Core.Compiler.cache_owner(interp::TestInterpreter) = interp.cache.owner
 
     Core.Compiler.InferenceParams(::TestInterpreter) = Core.Compiler.InferenceParams()
     Core.Compiler.OptimizationParams(::TestInterpreter) = Core.Compiler.OptimizationParams()
@@ -225,7 +230,7 @@ end
     mi = method_instance(test_fn, (Int,); world)
 
     interp = TestInterpreter(cache)
-    typeinf!(cache, interp, mi)
+    typeinf!(interp, mi)
 
     # CI is stored in cache, retrieve with get
     ci = get(cache, mi, nothing)
@@ -247,13 +252,13 @@ end
     mi2 = method_instance(const_return_fn, (Int,); world=world2)
 
     interp2 = TestInterpreter(cache2)
-    typeinf!(cache2, interp2, mi2)
+    typeinf!(interp2, mi2)
 
     ci2 = get(cache2, mi2, nothing)
     @test ci2 isa Core.CodeInstance
     # Verify it's actually a const-return CI (skip under coverage as it disables const-return)
     @test Core.Compiler.use_const_api(ci2) skip=(Base.JLOptions().code_coverage > 0)
-    # The key test: finish! hook should have stacked our results even for const-return
+    # The key test: results attach lazily even for const-return CIs
     @test results(cache2, ci2) isa InferenceResults
 end
 
@@ -271,7 +276,7 @@ end
     end
     ConstPropInterpreter(cache::CacheView) =
         ConstPropInterpreter(cache.world, cache, InfCacheT())
-    @setup_caching ConstPropInterpreter.cache
+    Core.Compiler.cache_owner(interp::ConstPropInterpreter) = interp.cache.owner
 
     Core.Compiler.InferenceParams(::ConstPropInterpreter) = Core.Compiler.InferenceParams()
     Core.Compiler.OptimizationParams(::ConstPropInterpreter) = Core.Compiler.OptimizationParams()
@@ -293,7 +298,7 @@ end
     interp = ConstPropInterpreter(cache)
 
     # 1. Generic inference
-    typeinf!(cache, interp, mi)
+    typeinf!(interp, mi)
     ci = get(cache, mi)
     @test ci.rettype === Int
     @test results(cache, ci) isa ConstPropResults
