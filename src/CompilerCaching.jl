@@ -380,11 +380,20 @@ ci = get!(cache, mi) do
 end
 ```
 """
+# Serializes the check-and-insert of `get!`; `f` runs outside it.
+const insert_lock = ReentrantLock()
+
 function Base.get!(f::Function, cache::CacheView, mi::Core.MethodInstance)
     ci = get(cache, mi, nothing)
     ci !== nothing && return ci
     ci = f()::Core.CodeInstance
-    cache[mi] = ci
+    # Another task may have inserted meanwhile; its CodeInstance wins, since results
+    # may already be attached to it.
+    Base.@lock insert_lock begin
+        existing = get(cache, mi, nothing)
+        existing !== nothing && return existing
+        cache[mi] = ci
+    end
     return ci
 end
 
@@ -725,9 +734,7 @@ function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
                 reset_inference_cache!(interp)
                 src = CC.typeinf_code(interp, callee_mi, true)
                 # Store source so get_codeinfos can retrieve it later
-                if src isa Core.CodeInfo && (@atomic callee.inferred) === nothing
-                    @atomic callee.inferred = src
-                end
+                src isa Core.CodeInfo && @atomicreplace(callee.inferred, nothing => src)
             end
             if src isa Core.CodeInfo
                 if has_compilequeue
@@ -767,9 +774,7 @@ function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
 
         # if ci is rettype_const, the inference result won't have been cached.
         # to avoid the need to re-infer, set that field here.
-        if ci.inferred === nothing
-            @atomic ci.inferred = src
-        end
+        @atomicreplace ci.inferred nothing => src
         return ci
     end
 end
