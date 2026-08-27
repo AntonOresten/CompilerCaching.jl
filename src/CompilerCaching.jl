@@ -373,6 +373,9 @@ Get an existing CodeInstance or create one using `f()`.
 Standard dict interface: returns existing CI if found, otherwise calls `f()`
 which must return a CodeInstance, stores it, and returns it.
 
+Concurrent misses may call `f()` more than once. The first CodeInstance inserted
+is returned to every caller; the other candidates are discarded.
+
 # Example (foreign mode)
 ```julia
 ci = get!(cache, mi) do
@@ -380,11 +383,20 @@ ci = get!(cache, mi) do
 end
 ```
 """
+# Serialize publication only; construction remains parallel across cache misses.
+const insert_lock = ReentrantLock()
+
 function Base.get!(f::Function, cache::CacheView, mi::Core.MethodInstance)
     ci = get(cache, mi, nothing)
     ci !== nothing && return ci
     ci = f()::Core.CodeInstance
-    cache[mi] = ci
+    # Another task may have inserted meanwhile; its CodeInstance wins, since results
+    # may already be attached to it.
+    Base.@lock insert_lock begin
+        existing = get(cache, mi, nothing)
+        existing !== nothing && return existing
+        cache[mi] = ci
+    end
     return ci
 end
 
@@ -690,9 +702,7 @@ function infer_source!(interp::CC.AbstractInterpreter, ci::Core.CodeInstance)
             if source_ci isa Core.CodeInstance && source_ci.rettype === ci.rettype
                 src = get(codegen, source_ci, nothing)
                 if src isa Core.CodeInfo
-                    if (@atomic ci.inferred) === nothing
-                        @atomic ci.inferred = src
-                    end
+                    @atomicreplace ci.inferred nothing => src
                     return src
                 end
             end
@@ -707,9 +717,7 @@ function infer_source!(interp::CC.AbstractInterpreter, ci::Core.CodeInstance)
     src = with_fresh_inference_cache(interp) do
         CC.typeinf_code(interp, mi, true)
     end
-    if src isa Core.CodeInfo && (@atomic ci.inferred) === nothing
-        @atomic ci.inferred = src
-    end
+    src isa Core.CodeInfo && @atomicreplace ci.inferred nothing => src
     return src
 end
 
@@ -809,9 +817,7 @@ function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
 
         # if ci is rettype_const, the inference result won't have been cached.
         # to avoid the need to re-infer, set that field here.
-        if ci.inferred === nothing
-            @atomic ci.inferred = src
-        end
+        @atomicreplace ci.inferred nothing => src
         return ci
     end
 end

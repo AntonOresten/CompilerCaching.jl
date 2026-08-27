@@ -1291,6 +1291,39 @@ end
     end
 end
 
+@testset "concurrent foreign-mode get!" begin
+    # N tasks compile the same method through the `get!` do-block: all must end up
+    # with the one CodeInstance the cache holds, so results attached by any task are
+    # visible to every other.
+    mutable struct ForeignRaceResults
+        tag::Any
+        ForeignRaceResults() = new(nothing)
+    end
+    foreign_race_fn(x::Int) = x + 1
+
+    ntasks = max(2 * Threads.nthreads(), 8)
+    for round in 1:(Threads.nthreads() > 1 ? 10 : 2)
+        world = Base.get_world_counter()
+        cache = CacheView{ForeignRaceResults}(Symbol("ForeignRace", round), world)
+        mi = method_instance(foreign_race_fn, (Int,); world)
+        cis = Vector{Any}(undef, ntasks)
+        @sync for t in 1:ntasks
+            Threads.@spawn begin
+                ci = get!(cache, mi) do
+                    yield()   # widen the window between the miss and the insert
+                    candidate = create_ci(cache, mi)
+                    results(cache, candidate).tag = t
+                    candidate
+                end
+                cis[t] = ci
+            end
+        end
+        @test all(ci -> ci === cis[1], cis)
+        @test get(cache, mi) === cis[1]
+        @test results(cache, cis[1]).tag in 1:ntasks
+    end
+end
+
 include("utils.jl")
 include("precompile.jl")
 
