@@ -635,19 +635,31 @@ method_instance
 
 export typeinf!, create_ci, get_source, get_codeinfos
 
-# Clear the interpreter-local const-prop cache: a `Vector{InferenceResult}` (1.12)
-# or `Compiler.InferenceCache` (1.13+, which lacks `empty!`).
-function reset_inference_cache!(interp::CC.AbstractInterpreter)
+# Run `f()` with an empty local inference cache, then restore the caller's
+# entries. The cache is either a `Vector{InferenceResult}` or, on newer Julia
+# versions, an `InferenceCache` with a separate index.
+function with_fresh_inference_cache(f, interp::CC.AbstractInterpreter)
     cache = CC.get_inference_cache(interp)
     @static if isdefined(Core.Compiler, :InferenceCache)
         if cache isa CC.InferenceCache
+            results, index = copy(cache.results), copy(cache.index)
             empty!(cache.results)
             empty!(cache.index)
-            return
+            try
+                return f()
+            finally
+                copy!(cache.results, results)
+                copy!(cache.index, index)
+            end
         end
     end
+    saved = copy(cache)
     empty!(cache)
-    return
+    try
+        return f()
+    finally
+        copy!(cache, saved)
+    end
 end
 
 function infer_source!(interp::CC.AbstractInterpreter, ci::Core.CodeInstance)
@@ -680,8 +692,9 @@ function infer_source!(interp::CC.AbstractInterpreter, ci::Core.CodeInstance)
     # (`LimitedAccuracy`) const-prop results left by a deeper root cascade would
     # otherwise suppress const-prop that succeeds in this shallower context
     # (JuliaGPU/CUDA.jl#3185).
-    reset_inference_cache!(interp)
-    src = CC.typeinf_code(interp, mi, true)
+    src = with_fresh_inference_cache(interp) do
+        CC.typeinf_code(interp, mi, true)
+    end
     if src isa Core.CodeInfo && (@atomic ci.inferred) === nothing
         @atomic ci.inferred = src
     end
