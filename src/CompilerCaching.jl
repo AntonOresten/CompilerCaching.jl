@@ -659,6 +659,59 @@ method_instance
 
 export typeinf!, create_ci, get_source, get_codeinfos
 
+# Julia's inference engine keys foreign-owner reservations by object address, while
+# the integrated cache compares owners with `egal`. Equal immutable owners can
+# therefore infer and publish the same MethodInstance concurrently. Serialize root
+# inference for one logical cache key, without blocking unrelated compilations.
+mutable struct InferenceReservation
+    owner::Any
+    mi::Core.MethodInstance
+    lock::ReentrantLock
+    users::Int
+end
+
+const inference_reservations = InferenceReservation[]
+const inference_reservations_lock = ReentrantLock()
+
+function acquire_inference_reservation(@nospecialize(owner), mi::Core.MethodInstance)
+    Base.@lock inference_reservations_lock begin
+        for reservation in inference_reservations
+            if reservation.owner === owner && reservation.mi === mi
+                reservation.users += 1
+                return reservation
+            end
+        end
+        reservation = InferenceReservation(owner, mi, ReentrantLock(), 1)
+        push!(inference_reservations, reservation)
+        return reservation
+    end
+end
+
+function release_inference_reservation(reservation::InferenceReservation)
+    Base.@lock inference_reservations_lock begin
+        reservation.users -= 1
+        if reservation.users == 0
+            i = findfirst(item -> item === reservation, inference_reservations)::Int
+            deleteat!(inference_reservations, i)
+        end
+    end
+    return
+end
+
+function with_inference_reservation(f, interp::CC.AbstractInterpreter,
+                                    mi::Core.MethodInstance)
+    reservation = acquire_inference_reservation(CC.cache_owner(interp), mi)
+    locked = false
+    try
+        lock(reservation.lock)
+        locked = true
+        return f()
+    finally
+        locked && unlock(reservation.lock)
+        release_inference_reservation(reservation)
+    end
+end
+
 # Run `f()` with an empty local inference cache, then restore the caller's
 # entries. The cache is either a `Vector{InferenceResult}` or, on newer Julia
 # versions, an `InferenceCache` with a separate index.
@@ -740,8 +793,17 @@ function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
     @static if VERSION >= v"1.12.0-DEV.1434"
         # `mi` is inferred exactly as requested; callers wanting a compileable
         # specialization should normalize before using it as a cache key.
-        ci = CC.typeinf_ext(interp, mi, CC.SOURCE_MODE_NOT_REQUIRED)
+        ci = with_inference_reservation(interp, mi) do
+            CC.typeinf_ext(interp, mi, CC.SOURCE_MODE_NOT_REQUIRED)
+        end
         ci === nothing && return nothing
+
+        # If another task inferred `mi` concurrently and published first, Julia's
+        # `cache_result!` skips our insert and `typeinf_ext` hands back the orphan.
+        # Adopt the published CodeInstance, so results attach to the one every cache
+        # lookup returns.
+        cache = CacheView{Nothing}(CC.cache_owner(interp), CC.get_inference_world(interp))
+        ci = @something get(cache, mi, nothing) ci
 
         # Eagerly compile all callees and store source
         has_compilequeue = VERSION >= v"1.13.0-DEV.499" || v"1.12-beta3" <= VERSION < v"1.13-"
@@ -791,7 +853,9 @@ function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
         return ci
     elseif VERSION >= v"1.12.0-DEV.15"
         cache = CacheView{Nothing}(CC.cache_owner(interp), CC.get_inference_world(interp))
-        inferred_ci = CC.typeinf_ext_toplevel(interp, mi, CC.SOURCE_MODE_FORCE_SOURCE)
+        inferred_ci = with_inference_reservation(interp, mi) do
+            CC.typeinf_ext_toplevel(interp, mi, CC.SOURCE_MODE_FORCE_SOURCE)
+        end
         @assert inferred_ci !== nothing "Inference of $mi failed"
 
         # inference should have populated the cache
@@ -808,7 +872,9 @@ function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
     else
         # Julia 1.11: typeinf_ext_toplevel returns CodeInfo, not CI
         cache = CacheView{Nothing}(CC.cache_owner(interp), CC.get_inference_world(interp))
-        src = CC.typeinf_ext_toplevel(interp, mi)
+        src = with_inference_reservation(interp, mi) do
+            CC.typeinf_ext_toplevel(interp, mi)
+        end
         @assert src !== nothing "Inference of $mi failed"
 
         # inference should have populated the cache

@@ -1289,6 +1289,32 @@ end
         @test length(CompilerCaching.find_results(RaceResults, ci).const_entries) == 1
         @test all(r -> r === seen[1], seen)
     end
+
+    # Root inference racing on an isbits owner: the engine keys reservations by the
+    # boxed owner's address, while the integrated cache compares owners by value.
+    # CompilerCaching must serialize the logical cache key so every caller gets the
+    # same published CodeInstance. A deep callee chain widens the race window.
+    struct IsbitsOwner
+        id::Int
+    end
+    for i in 1:32
+        @eval @noinline $(Symbol(:race_deep_, i))(x, k) =
+            $(i == 1 ? :(x * k + 1) : :($(Symbol(:race_deep_, i-1))(x, k) + $i))
+    end
+    race_deep_kernel(x, k) = race_deep_32(x, k)
+    for round in 1:rounds
+        world = Base.get_world_counter()
+        cache = CacheView{RaceResults}(IsbitsOwner(round), world)
+        mi = method_instance(race_deep_kernel, (Int, Int); world)
+        seen = Vector{Any}(undef, ntasks)
+        @sync for t in 1:ntasks
+            Threads.@spawn begin
+                seen[t] = typeinf!(RaceInterpreter(cache), mi)
+            end
+        end
+        ci = get(cache, mi)
+        @test all(c -> c === ci, seen)
+    end
 end
 
 @testset "concurrent foreign-mode get!" begin
