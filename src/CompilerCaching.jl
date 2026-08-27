@@ -83,6 +83,22 @@ mutable struct CachedResult{V}
     CachedResult{V}(inner::V) where V = new{V}(inner, SpecializedResult{V}[])
 end
 
+# Guards every `const_entries` vector. One global lock: the critical sections are
+# short scans, and a per-CI lock could not be persisted with the CI anyway.
+const const_entries_lock = ReentrantLock()
+
+@inline function find_const_entry(cached::CachedResult{V}, argtypes::Vector{Any}) where V
+    for entry in cached.const_entries
+        argtypes_egal(entry.argtypes, argtypes) && return entry
+    end
+    return nothing
+end
+
+# Locked lookup of a const-seeded entry.
+function const_entry(cached::CachedResult{V}, argtypes::Vector{Any}) where V
+    Base.@lock const_entries_lock find_const_entry(cached, argtypes)
+end
+
 """
     get_invoke_mi(stmt::Expr) -> Union{MethodInstance, Nothing}
 
@@ -283,11 +299,9 @@ generic accessor, const-specialized entries are only created by [`typeinf!`](@re
 with `argtypes`; this throws if no matching entry exists.
 """
 function results(::Type{V}, ci::Core.CodeInstance, argtypes::Vector{Any})::V where V
-    cached = get_results(V, ci)
-    for entry in cached.const_entries
-        argtypes_egal(entry.argtypes, argtypes) && return entry.inner
-    end
-    error("CodeInstance missing $V results for argtypes $argtypes")
+    entry = const_entry(get_results(V, ci), argtypes)
+    entry === nothing && error("CodeInstance missing $V results for argtypes $argtypes")
+    return entry.inner
 end
 
 results(::CacheView{K,V}, ci::Core.CodeInstance, argtypes::Vector{Any}) where {K,V} =
@@ -341,11 +355,9 @@ end
                         argtypes::Vector{Any}) where {K,V}
     ci = get(cache, mi, nothing)
     ci === nothing && return nothing
-    cached = get_results(V, ci)
-    for entry in cached.const_entries
-        argtypes_egal(entry.argtypes, argtypes) && return (ci, entry.inner)
-    end
-    return nothing
+    entry = const_entry(get_results(V, ci), argtypes)
+    entry === nothing && return nothing
+    return (ci, entry.inner)
 end
 
 
@@ -818,6 +830,11 @@ and `get_source(ci, argtypes)`.
 Unlike the generic `typeinf!(interp, mi)`, this form takes a `CacheView`: const-prop
 entries are stored typed, so the results type `V` must be known up front. The cache
 view must match the interpreter's owner and world.
+
+Safe to call concurrently from multiple tasks, each with its own interpreter. Tasks
+seeding the same `(ci, argtypes)` at the same time may both run inference; the first
+to finish publishes its entry and the others discard theirs. The interpreter must not
+be shared between tasks: its inference cache is mutated during the walk over callees.
 """
 function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
                   mi::Core.MethodInstance, argtypes::Vector{Any}) where {K,V}
@@ -834,10 +851,7 @@ function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
 
     cached = get_results(V, ci)
 
-    # Check if we already have a const-prop result for these argtypes
-    for entry in cached.const_entries
-        argtypes_egal(entry.argtypes, argtypes) && return
-    end
+    const_entry(cached, argtypes) === nothing || return
 
     # Compute overridden_by_const
     𝕃 = CC.typeinf_lattice(interp)
@@ -879,10 +893,15 @@ function typeinf!(cache::CacheView{K,V}, interp::CC.AbstractInterpreter,
     rettype = inf_result.result
     rettype_const = rettype isa CC.Const ? rettype.val : nothing
 
-    # Store const-prop entry on the mutable CachedResult
-    # (must happen before recursive walk so the duplicate check on lines 441-443 prevents cycles)
+    # Publish the entry unless another task got there first. Copy on write, since
+    # readers may hold the old vector. This precedes the recursive walk so the
+    # entry check above terminates cycles.
     entry = SpecializedResult{V}(argtypes, v, src, rettype, rettype_const)
-    push!(cached.const_entries, entry)
+    Base.@lock const_entries_lock begin
+        if find_const_entry(cached, argtypes) === nothing
+            cached.const_entries = push!(copy(cached.const_entries), entry)
+        end
+    end
 
     # Recursively const-seed callees with propagated const argtypes.
     # Walk the *generic* source (which has :invoke stmts pointing to callee CIs)
@@ -1081,13 +1100,10 @@ function get_source(ci::Core.CodeInstance, argtypes::Vector{Any})
         result isa CachedResult ? result : nothing
     end
     cached === nothing && return nothing
-    for entry in cached.const_entries
-        if argtypes_egal(entry.argtypes, argtypes)
-            src = entry.src
-            return src isa Core.CodeInfo ? src : nothing
-        end
-    end
-    return nothing
+    entry = const_entry(cached, argtypes)
+    entry === nothing && return nothing
+    src = entry.src
+    return src isa Core.CodeInfo ? src : nothing
 end
 
 """
