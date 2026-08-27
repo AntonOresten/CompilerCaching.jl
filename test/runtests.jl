@@ -1211,6 +1211,26 @@ end
         @test length(CompilerCaching.find_results(RaceResults, ci).const_entries) == 1
         @test all(r -> r === seen[1], seen)
     end
+
+    # Root inference racing on an isbits owner: the engine keys reservations by owner
+    # identity, so every task infers `mi` itself, and only the first publishes. All of
+    # them must still hand back the published CodeInstance.
+    struct IsbitsOwner
+        id::Int
+    end
+    for round in 1:rounds
+        world = Base.get_world_counter()
+        cache = CacheView{RaceResults}(IsbitsOwner(round), world)
+        mi = method_instance(race_kernel, (Int, Int); world)
+        seen = Vector{Any}(undef, ntasks)
+        @sync for t in 1:ntasks
+            Threads.@spawn begin
+                seen[t] = typeinf!(RaceInterpreter(cache), mi)
+            end
+        end
+        ci = get(cache, mi)
+        @test all(c -> c === ci, seen)
+    end
 end
 
 @testset "concurrent foreign-mode get!" begin

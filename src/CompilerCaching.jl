@@ -693,6 +693,13 @@ function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
         ci = CC.typeinf_ext(interp, mi, CC.SOURCE_MODE_NOT_REQUIRED)
         ci === nothing && return nothing
 
+        # If another task inferred `mi` concurrently and published first, Julia's
+        # `cache_result!` skips our insert and `typeinf_ext` hands back the orphan.
+        # Adopt the published CodeInstance, so results attach to the one every cache
+        # lookup returns.
+        cache = CacheView{Nothing}(CC.cache_owner(interp), CC.get_inference_world(interp))
+        ci = @something get(cache, mi, nothing) ci
+
         # Eagerly compile all callees and store source
         has_compilequeue = VERSION >= v"1.13.0-DEV.499" || v"1.12-beta3" <= VERSION < v"1.13-"
         if has_compilequeue
