@@ -487,6 +487,33 @@ end
     @test !any(stmt -> occursin("Int32", string(stmt)), src.code)
 end
 
+@testset "preserve inference cache during callee walk" begin
+    # The source walk re-infers callees in isolation, but must not discard
+    # results accumulated by the root inference or an earlier batch member.
+    @noinline walk_callee(x, k) = x * k
+    walk_kernel(x) = walk_callee(x, 3) + walk_callee(x, 5)
+
+    world = Base.get_world_counter()
+    cache = CacheView{TestResults}(:WalkCacheTest, world)
+    interp = TestInterpreter(cache.world, cache, InfCacheT())
+
+    marker_mi = method_instance(walk_callee, (Int, Int); world)
+    𝕃 = Core.Compiler.typeinf_lattice(interp)
+    @static if VERSION >= v"1.12-"
+        argtypes = Core.Compiler.matching_cache_argtypes(𝕃, marker_mi)
+        overridden = falses(length(argtypes))
+    else
+        argtypes, overridden = Core.Compiler.matching_cache_argtypes(𝕃, marker_mi)
+    end
+    argtypes[3] = Core.Const(7)
+    marker = Core.Compiler.InferenceResult(marker_mi, argtypes, overridden)
+    push!(Core.Compiler.get_inference_cache(interp), marker)
+
+    typeinf!(interp, method_instance(walk_kernel, (Int,); world))
+
+    @test marker in Core.Compiler.get_inference_cache(interp)
+end
+
 @testset "unresolved invoke targets" begin
     # Inlining's `compileable_specialization` leaves an `:invoke` target as a bare
     # MethodInstance when the compileable specialization is not cached at optimization
