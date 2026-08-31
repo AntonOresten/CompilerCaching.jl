@@ -1125,11 +1125,20 @@ function collect_codeinfos(interp::CC.AbstractInterpreter,
 end
 
 @static if VERSION >= v"1.12-"
-# Mirror of nightly's `Compiler.has_valid_abi_sparams`: specializations with
-# incomplete sparams (TypeVar) or SimpleVector/Vararg sparams cannot be called
-# through a native specsig ABI — codegen's `needsparams` path emits `jl_invoke`
-# even for CodeInstance operands, so rewriting such targets is useless.
+# Specializations with incomplete sparams cannot be called through a native specsig
+# ABI: codegen's `needsparams` path emits `jl_invoke` even for CodeInstance operands,
+# so rewriting such targets is useless. Delegate the structural checks to Compiler
+# when available, but retain the explicit TypeVar check: codegen rejects free type
+# variables while Compiler.has_valid_abi_sparams currently does not.
 function has_valid_abi_sparams(mi::Core.MethodInstance)
+    @static if isdefined(Core.Compiler, :has_valid_abi_sparams)
+        CC.has_valid_abi_sparams(mi) || return false
+        for sp in mi.sparam_vals
+            sp isa TypeVar && return false
+        end
+        return true
+    end
+
     for sp in mi.sparam_vals
         if sp isa TypeVar || sp isa Core.SimpleVector || CC.isvarargtype(sp)
             return false

@@ -389,6 +389,29 @@ end
 end
 
 @static if VERSION >= v"1.12-"
+@static if isdefined(Core.Compiler, :has_valid_abi_sparams)
+@testset "ABI-compatible static parameters" begin
+    abi_sparam_fn(x::T) where T = x
+    method = only(methods(abi_sparam_fn))
+    valid = Core.Compiler.specialize_method(method,
+                                            Tuple{typeof(abi_sparam_fn), Int},
+                                            Core.svec(Int);
+                                            preexisting=false)
+    missing = Core.Compiler.specialize_method(method,
+                                              Tuple{typeof(abi_sparam_fn), Float64},
+                                              Core.svec();
+                                              preexisting=false)
+    unresolved = Core.Compiler.specialize_method(method,
+                                                 Tuple{typeof(abi_sparam_fn), String},
+                                                 Core.svec(TypeVar(:T));
+                                                 preexisting=false)
+
+    @test CompilerCaching.has_valid_abi_sparams(valid)
+    @test !CompilerCaching.has_valid_abi_sparams(missing)
+    @test !CompilerCaching.has_valid_abi_sparams(unresolved)
+end
+end
+
 @testset "stale const-prop tombstones" begin
     # A tombstoned (LimitedAccuracy) const-prop result left in the local cache by
     # the root cascade must not suppress const-prop during the callee walk's
