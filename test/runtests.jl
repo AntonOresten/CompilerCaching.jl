@@ -224,9 +224,13 @@ end
         world::UInt
         cache::CacheView
         inf_cache::InfCacheT
+        codegen::Union{Nothing, IdDict{Core.CodeInstance, Core.CodeInfo}}
     end
+    TestInterpreter(world::UInt, cache::CacheView, inf_cache::InfCacheT) =
+        TestInterpreter(world, cache, inf_cache, nothing)
     TestInterpreter(cache::CacheView) =
-        TestInterpreter(cache.world, cache, InfCacheT())
+        TestInterpreter(cache.world, cache, InfCacheT(),
+                        IdDict{Core.CodeInstance, Core.CodeInfo}())
     Core.Compiler.cache_owner(interp::TestInterpreter) = interp.cache.owner
 
     Core.Compiler.InferenceParams(::TestInterpreter) = Core.Compiler.InferenceParams()
@@ -239,6 +243,10 @@ end
     end
     Core.Compiler.lock_mi_inference(::TestInterpreter, ::Core.MethodInstance) = nothing
     Core.Compiler.unlock_mi_inference(::TestInterpreter, ::Core.MethodInstance) = nothing
+    @static if isdefined(Core.Compiler, :find_cached_ci) &&
+               isdefined(Core.Compiler, :codegen_cache)
+        Core.Compiler.codegen_cache(interp::TestInterpreter) = interp.codegen
+    end
 
     test_fn(x::Int) = x + 1
     world = Base.get_world_counter()
@@ -255,6 +263,20 @@ end
     # Get CodeInfo via get_source
     src = get_source(ci)
     @test src isa Core.CodeInfo
+    @static if isdefined(Core.Compiler, :find_cached_ci) &&
+               isdefined(Core.Compiler, :codegen_cache)
+        # SOURCE_MODE_GET_SOURCE retains source in the interpreter's transient cache;
+        # reconstruct a source-less cache head and verify CompilerCaching additionally
+        # persists the transient source on that stable integrated-cache CI.
+        @test haskey(interp.codegen, ci)
+        @atomic ci.inferred = nothing
+        @test get_source(ci) === nothing
+        @test typeinf!(interp, mi) === ci
+        stored = @atomic ci.inferred
+        @test stored isa Core.CodeInfo
+        empty!(interp.codegen)
+        @test get_source(ci) === stored
+    end
 
     # Test that results accessor works on inferred CI
     res = results(cache, ci)
@@ -435,7 +457,13 @@ end
 
     world = Base.get_world_counter()
     cache = CacheView{TestResults}(:TombstoneTest, world)
-    interp = TestInterpreter(cache.world, cache, InfCacheT())
+    interp = @static if isdefined(Core.Compiler, :find_cached_ci) &&
+                        isdefined(Core.Compiler, :codegen_cache)
+        TestInterpreter(cache.world, cache, InfCacheT(),
+                        IdDict{Core.CodeInstance, Core.CodeInfo}())
+    else
+        TestInterpreter(cache.world, cache, InfCacheT())
+    end
 
     # seed a tombstone for `set_flag!(::Ptr{Int64}, Const(:a), ::Ptr{UInt8})`
     si_mi = method_instance(set_flag!, (Ptr{Int64}, Symbol, Ptr{UInt8}); world)

@@ -650,6 +650,44 @@ function reset_inference_cache!(interp::CC.AbstractInterpreter)
     return
 end
 
+function infer_source!(interp::CC.AbstractInterpreter, ci::Core.CodeInstance)
+    mi = CC.get_ci_mi(ci)
+    @static if isdefined(Core.Compiler, :find_cached_ci) &&
+               isdefined(Core.Compiler, :codegen_cache) &&
+               isdefined(Core.Compiler, :SOURCE_MODE_GET_SOURCE)
+        # On Julia 1.14+, SOURCE_MODE_GET_SOURCE searches past source-less entries in
+        # the integrated cache and gives interpreters with a codegen cache a fresh,
+        # source-capable inference result when necessary. Persist that transient source
+        # on the original CI: CompilerCaching relies on it surviving package images and
+        # on keeping the CI identity to which analysis results may already be attached.
+        codegen = CC.codegen_cache(interp)
+        if codegen !== nothing
+            source_ci = CC.typeinf_ext(interp, mi, CC.SOURCE_MODE_GET_SOURCE)
+            if source_ci isa Core.CodeInstance && source_ci.rettype === ci.rettype
+                src = get(codegen, source_ci, nothing)
+                if src isa Core.CodeInfo
+                    if (@atomic ci.inferred) === nothing
+                        @atomic ci.inferred = src
+                    end
+                    return src
+                end
+            end
+        end
+    end
+
+    # Older compilers and interpreters without a codegen cache need standalone
+    # re-inference. Make it behave like a fresh `jl_typeinf` entry: tombstoned
+    # (`LimitedAccuracy`) const-prop results left by a deeper root cascade would
+    # otherwise suppress const-prop that succeeds in this shallower context
+    # (JuliaGPU/CUDA.jl#3185).
+    reset_inference_cache!(interp)
+    src = CC.typeinf_code(interp, mi, true)
+    if src isa Core.CodeInfo && (@atomic ci.inferred) === nothing
+        @atomic ci.inferred = src
+    end
+    return src
+end
+
 """
     typeinf!(interp, mi) -> Union{CodeInstance, Nothing}
 
@@ -706,16 +744,7 @@ function typeinf!(interp::CC.AbstractInterpreter, mi::Core.MethodInstance)
             # followed by the back-end's compile) traversal-only.
             src = get_source(callee)
             if src === nothing
-                # Standalone re-inference must behave like a fresh `jl_typeinf` entry:
-                # tombstoned (`LimitedAccuracy`) const-prop results left by the deeper
-                # root cascade would otherwise suppress const-prop that succeeds in
-                # this shallower context (JuliaGPU/CUDA.jl#3185).
-                reset_inference_cache!(interp)
-                src = CC.typeinf_code(interp, callee_mi, true)
-                # Store source so get_codeinfos can retrieve it later
-                if src isa Core.CodeInfo && (@atomic callee.inferred) === nothing
-                    @atomic callee.inferred = src
-                end
+                src = infer_source!(interp, callee)
             end
             if src isa Core.CodeInfo
                 if has_compilequeue
